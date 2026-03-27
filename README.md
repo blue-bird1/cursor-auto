@@ -1,110 +1,92 @@
-# telegram-bot-cli
+# Telegram 自用 CLI 工具
 
-在 Cursor 自动化环境中，作为 `telegram mcp` 不可用时的替代方案，本项目提供一个 **CLI 工具**，实现与 `@iqai/mcp-telegram` 核心能力等效的 Telegram Bot 操作。
+你说得对：这里不是要做“库发布”，而是要做**仓库内自用工具**。  
+本仓库现在提供 `scripts/telegram.sh`，用于在 Cursor 自动化环境下直接调用 Telegram Bot API（无需 MCP）。
 
-## 功能对照（CLI 等效能力）
+## 目标
 
-- `SEND_MESSAGE` -> `send-message`
-- `GET_CHANNEL_INFO` -> `get-chat-info`
-- `FORWARD_MESSAGE` -> `forward-message`
-- `PIN_MESSAGE` -> `pin-message`
-- `GET_CHANNEL_MEMBERS`（管理员列表）-> `get-chat-admins`
+在 `telegram mcp` 失效时，提供同等核心能力的 CLI：
 
-> 说明：这里实现的是 **命令行工具**，不依赖 MCP 协议运行。
+- `send-message`（发消息）
+- `get-chat-info`（查群/频道信息）
+- `forward-message`（转发）
+- `pin-message`（置顶）
+- `get-chat-admins`（管理员列表）
 
-## 环境要求
-
-- Node.js 18+
-- Telegram Bot Token（从 [@BotFather](https://t.me/botfather) 获取）
-
-## 安装与构建
+## 快速开始（自用优先）
 
 ```bash
 npm install
-npm run build
+cp .env.example .env
+# 编辑 .env，填好 TELEGRAM_BOT_TOKEN（可选 TELEGRAM_DEFAULT_CHAT_ID）
 ```
+
+直接使用脚本：
+
+```bash
+./scripts/telegram.sh help
+./scripts/telegram.sh send --text "hello"
+```
+
+> `send` 是 `send-message` 的别名；如果 `.env` 里配置了 `TELEGRAM_DEFAULT_CHAT_ID`，可以省略 `--chat-id`。
 
 ## 环境变量
 
-复制示例文件并填写 Token：
+`.env.example`：
 
 ```bash
-cp .env.example .env
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_DEFAULT_CHAT_ID=
 ```
 
-`.env` 内容示例：
+- `TELEGRAM_BOT_TOKEN`：必填
+- `TELEGRAM_DEFAULT_CHAT_ID`：可选，自用场景推荐设置（可让常用命令不用反复写 chat id）
+
+## 命令示例
+
+### 发消息
 
 ```bash
-TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+./scripts/telegram.sh send --text "任务完成"
+./scripts/telegram.sh send --chat-id @mychannel --text "Hello from CLI"
 ```
 
-## 使用方式
-
-### 查看帮助
+### 查信息
 
 ```bash
-npm run help
+./scripts/telegram.sh info
+./scripts/telegram.sh info --chat-id @mychannel
 ```
 
-或：
+### 转发
 
 ```bash
-npx tsx src/cli.ts help
-```
-
-### 1) 发送消息
-
-```bash
-npx tsx src/cli.ts send-message \
-  --chat-id @mychannel \
-  --text "Hello from CLI"
-```
-
-可选参数：
-
-- `--topic-id <number>`
-- `--parse-mode <HTML|Markdown|MarkdownV2>`
-- `--disable-web-page-preview [true|false]`
-- `--disable-notification [true|false]`
-
-### 2) 获取群组/频道信息
-
-```bash
-npx tsx src/cli.ts get-chat-info --chat-id @mychannel
-```
-
-### 3) 转发消息
-
-```bash
-npx tsx src/cli.ts forward-message \
+./scripts/telegram.sh forward-message \
   --from-chat-id @source_channel \
   --to-chat-id @target_channel \
   --message-id 123
 ```
 
-### 4) 置顶消息
+### 置顶
 
 ```bash
-npx tsx src/cli.ts pin-message \
-  --chat-id @mychannel \
-  --message-id 123
+./scripts/telegram.sh pin --message-id 123
 ```
 
-### 5) 获取管理员列表
+### 管理员列表
 
 ```bash
-npx tsx src/cli.ts get-chat-admins --chat-id @mychannel --limit 10
+./scripts/telegram.sh admins --limit 10
 ```
 
-## 输出格式
+## 输出
 
-所有命令输出 JSON：
+统一 JSON 输出，便于自动化脚本处理：
 
 - 成功：`{ "success": true, ... }`
 - 失败：`{ "success": false, "error": "..." }`
 
-## 注意事项
+## 说明
 
-1. Bot 必须被加入目标群组/频道，并具有对应权限（发消息、置顶等）。
-2. 对于频道建议使用 `@channel_username` 或 `-100xxxxxxxxxx` 的 chat id。
-3. 若命令失败，请先检查 Token、chat id、以及 Bot 权限。
+- 这是仓库内工具，不依赖发布到 npm。
+- 你和自动化任务都可以直接调用 `./scripts/telegram.sh ...`。

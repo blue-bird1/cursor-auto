@@ -1,16 +1,15 @@
 {
   "name": "telegram-cli-tool",
   "version": "1.0.0",
+  "private": true,
   "description": "Telegram Bot CLI with MCP-equivalent core capabilities",
   "main": "dist/cli.js",
-  "bin": {
-    "telegram-bot-cli": "dist/cli.js"
-  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
-    "help": "tsx src/cli.ts help"
+    "help": "tsx src/cli.ts help",
+    "tg": "tsx src/cli.ts"
   },
   "repository": {
     "type": "git",

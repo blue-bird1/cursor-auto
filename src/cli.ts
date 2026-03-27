@@ -11,6 +11,7 @@ type ParsedArgs = {
 };
 
 const tokenSchema = z.string().min(1, "TELEGRAM_BOT_TOKEN 未设置");
+const defaultChatSchema = z.string().trim().optional();
 
 const HELP_TEXT = `
 telegram-bot-cli - Telegram Bot CLI
@@ -22,10 +23,10 @@ telegram-bot-cli - Telegram Bot CLI
   help
       显示帮助信息
 
-  send-message
+  send-message (别名: send)
       发送消息到群组/频道/用户
       必填:
-        --chat-id <id|@username>
+        --chat-id <id|@username> (可省略，回退 TELEGRAM_DEFAULT_CHAT_ID)
         --text <message>
       可选:
         --topic-id <number>
@@ -33,10 +34,10 @@ telegram-bot-cli - Telegram Bot CLI
         --disable-web-page-preview [true|false]
         --disable-notification [true|false]
 
-  get-chat-info
+  get-chat-info (别名: info)
       获取群组/频道信息
       必填:
-        --chat-id <id|@username>
+        --chat-id <id|@username> (可省略，回退 TELEGRAM_DEFAULT_CHAT_ID)
 
   forward-message
       转发消息
@@ -47,24 +48,24 @@ telegram-bot-cli - Telegram Bot CLI
       可选:
         --disable-notification [true|false]
 
-  pin-message
+  pin-message (别名: pin)
       置顶消息
       必填:
-        --chat-id <id|@username>
+        --chat-id <id|@username> (可省略，回退 TELEGRAM_DEFAULT_CHAT_ID)
         --message-id <number>
       可选:
         --disable-notification [true|false]
 
-  get-chat-admins
+  get-chat-admins (别名: admins)
       获取群组/频道管理员
       必填:
-        --chat-id <id|@username>
+        --chat-id <id|@username> (可省略，回退 TELEGRAM_DEFAULT_CHAT_ID)
       可选:
         --limit <1-50> (默认 10)
 
 示例:
-  telegram-bot-cli send-message --chat-id @mychannel --text "hello"
-  telegram-bot-cli get-chat-info --chat-id -1001234567890
+  telegram-bot-cli send --chat-id @mychannel --text "hello"
+  telegram-bot-cli info --chat-id -1001234567890
   telegram-bot-cli forward-message --from-chat-id @a --to-chat-id @b --message-id 123
 `;
 
@@ -117,6 +118,21 @@ function getOptionalString(
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function getChatIdOrDefault(
+  options: Record<string, string | boolean>,
+  key = "chat-id",
+): string {
+  const explicit = getOptionalString(options, key);
+  if (explicit) {
+    return explicit;
+  }
+  const fallback = defaultChatSchema.parse(process.env.TELEGRAM_DEFAULT_CHAT_ID);
+  if (fallback && fallback.length > 0) {
+    return fallback;
+  }
+  throw new Error(`缺少必填参数 --${key}，且 TELEGRAM_DEFAULT_CHAT_ID 也未设置`);
 }
 
 function parseBoolean(
@@ -178,8 +194,9 @@ async function run(): Promise<void> {
   const telegram = bot.telegram;
 
   switch (command) {
-    case "send-message": {
-      const chatId = getRequiredString(options, "chat-id");
+    case "send-message":
+    case "send": {
+      const chatId = getChatIdOrDefault(options, "chat-id");
       const text = getRequiredString(options, "text");
       const topicId = parseInteger(
         getOptionalString(options, "topic-id"),
@@ -222,8 +239,9 @@ async function run(): Promise<void> {
       return;
     }
 
-    case "get-chat-info": {
-      const chatId = getRequiredString(options, "chat-id");
+    case "get-chat-info":
+    case "info": {
+      const chatId = getChatIdOrDefault(options, "chat-id");
       const chat = await telegram.getChat(chatId);
       console.log(
         JSON.stringify(
@@ -277,8 +295,9 @@ async function run(): Promise<void> {
       return;
     }
 
-    case "pin-message": {
-      const chatId = getRequiredString(options, "chat-id");
+    case "pin-message":
+    case "pin": {
+      const chatId = getChatIdOrDefault(options, "chat-id");
       const messageId = parseInteger(
         getRequiredString(options, "message-id"),
         "message-id",
@@ -308,8 +327,9 @@ async function run(): Promise<void> {
       return;
     }
 
-    case "get-chat-admins": {
-      const chatId = getRequiredString(options, "chat-id");
+    case "get-chat-admins":
+    case "admins": {
+      const chatId = getChatIdOrDefault(options, "chat-id");
       const limit =
         parseInteger(getOptionalString(options, "limit"), "limit", 1, 50) ?? 10;
       const admins = await telegram.getChatAdministrators(chatId);
