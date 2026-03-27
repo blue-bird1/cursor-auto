@@ -195,11 +195,14 @@ async function run(): Promise<void> {
         options["disable-notification"],
         false,
       );
+      const linkPreviewOptions = disableWebPagePreview
+        ? { is_disabled: true }
+        : undefined;
 
       const message = await telegram.sendMessage(chatId, text, {
         message_thread_id: topicId,
         parse_mode: parseMode as "HTML" | "Markdown" | "MarkdownV2" | undefined,
-        disable_web_page_preview: disableWebPagePreview,
+        link_preview_options: linkPreviewOptions,
         disable_notification: disableNotification,
       });
 
