@@ -90,3 +90,24 @@ TELEGRAM_DEFAULT_CHAT_ID=
 
 - 这是仓库内工具，不依赖发布到 npm。
 - 你和自动化任务都可以直接调用 `./scripts/telegram.sh ...`。
+
+## Steam Key 低价巡检工具（新增）
+
+为降低自动化 Agent 每次运行的编排开销，新增了通用巡检脚本目录：
+
+- `tools/steam_key_daily/inspect.mjs`
+- `scripts/steam_key_daily.sh`
+
+快速示例：
+
+```bash
+# 仅演练（不发消息、不写回）
+./scripts/steam_key_daily.sh --state-path tools/steam_key_daily/state.local.json --dry-run
+
+# 有新增/变更时发送到默认 chat，并写回本地状态
+./scripts/steam_key_daily.sh --state-path tools/steam_key_daily/state.local.json --send --write-state
+```
+
+详细字段、输出文件与边界说明见：
+
+- `tools/steam_key_daily/README.md`
