@@ -114,7 +114,8 @@ function decodeHtmlEntities(text) {
     .replaceAll("&lt;", "<")
     .replaceAll("&gt;", ">")
     .replaceAll("&quot;", "\"")
-    .replaceAll("&#39;", "'");
+    .replaceAll("&#39;", "'")
+    .replaceAll("&#039;", "'");
 }
 
 function stripHtml(text) {
@@ -144,7 +145,7 @@ function parseRssItems(xml, maxItems = MAX_ITEMS) {
     const pubDate = readFirstCapture(block, /<pubDate>([\s\S]*?)<\/pubDate>/i);
     const description = readFirstCapture(
       block,
-      /<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>/i,
+      /<description>\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*<\/description>/i,
     );
     return {
       title: title || "未确认",
@@ -273,11 +274,22 @@ function parseOfficialUrl(rawUrl) {
   }
   try {
     const url = new URL(rawUrl);
-    const forwarded = url.searchParams.get("u");
-    if (!forwarded) {
-      return rawUrl;
+    const forwarded = url.searchParams.get("u") || url.searchParams.get("url");
+    if (forwarded) {
+      return parseOfficialUrl(decodeURIComponent(forwarded));
     }
-    return decodeURIComponent(forwarded);
+    const cleaned = new URL(`${url.origin}${url.pathname}`);
+    for (const [key, value] of url.searchParams.entries()) {
+      if (
+        /^utm_/i.test(key) ||
+        ["ref", "aff", "affiliate", "clickid", "cjdata"].includes(key.toLowerCase())
+      ) {
+        continue;
+      }
+      cleaned.searchParams.set(key, value);
+    }
+    const normalized = cleaned.toString().replace(/\/+$/, "");
+    return normalized;
   } catch {
     return rawUrl;
   }
@@ -288,7 +300,11 @@ function cnyFromPriceTuple(priceTuple) {
     return 0;
   }
   const raw = Number(priceTuple[0]);
+  const currency = String(priceTuple[1] ?? "").toUpperCase();
   if (!Number.isFinite(raw)) {
+    return 0;
+  }
+  if (currency !== "CNY") {
     return 0;
   }
   return Number((raw / 100).toFixed(2));
@@ -319,23 +335,30 @@ function parseRssDescriptionTiers(descriptionHtml) {
     const name = stripHtml(chunk[1] ?? "").trim() || "Tier";
     const body = chunk[2] ?? "";
     const priceRaw = readFirstCapture(body, /Price:\s*¥\s*([0-9]+(?:\.[0-9]+)?)/i);
-    const games = [...body.matchAll(/<a[^>]*>([\s\S]*?)<\/a>/gi)]
-      .map((m) => stripHtml(m[1] ?? ""))
+    const games = [...body.matchAll(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi)]
+      .filter((m) => String(m[1] ?? "").includes("/game/"))
+      .map((m) => stripHtml(m[2] ?? ""))
       .filter(Boolean);
     return {
       name,
-      price_cny: Number(priceRaw || "0"),
+      price_cny: priceRaw ? Number(priceRaw) : null,
       games,
     };
   });
 }
 
+function parseRssExpiry(descriptionHtml) {
+  const expiryRaw = readFirstCapture(descriptionHtml, /expires on\s*([^<|]+)/i);
+  return expiryRaw || "未确认";
+}
+
 function isSteamGame(game, steamShopId) {
   const keys = Array.isArray(game?.keys) ? game.keys : [];
-  const inKeys = steamShopId > 0 && keys.includes(steamShopId);
+  if (keys.length > 0) {
+    return steamShopId > 0 && keys.includes(steamShopId);
+  }
   const reviews = Array.isArray(game?.reviews) ? game.reviews : [];
-  const inReviews = reviews.some((x) => String(x?.source ?? "").toLowerCase() === "steam");
-  return inKeys || inReviews;
+  return reviews.some((x) => String(x?.source ?? "").toLowerCase() === "steam");
 }
 
 function computePositiveRateText(review) {
@@ -357,6 +380,33 @@ function computeGameFingerprint(tiers) {
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
   return hashText(JSON.stringify(normalized));
+}
+
+function normalizeTierPrice(price, games) {
+  const num = Number(price);
+  if (!Number.isFinite(num) || num <= 0) {
+    return Array.isArray(games) && games.length > 0 ? 0 : null;
+  }
+  return Number(num.toFixed(2));
+}
+
+function normalizeTiersForComparison(tiers) {
+  return (Array.isArray(tiers) ? tiers : [])
+    .map((tier, index) => ({
+      name: String(tier?.name ?? `Tier ${index + 1}`).trim() || `Tier ${index + 1}`,
+      price_cny: normalizeTierPrice(tier?.price_cny, tier?.games),
+      games: (Array.isArray(tier?.games) ? tier.games : [])
+        .map((game) => decodeHtmlEntities(String(game ?? "").trim()))
+        .filter(Boolean),
+    }))
+    .filter((tier) => tier.games.length > 0 || tier.price_cny !== null);
+}
+
+function haveEquivalentTiers(prevTiers, currentTiers) {
+  return (
+    JSON.stringify(normalizeTiersForComparison(prevTiers)) ===
+    JSON.stringify(normalizeTiersForComparison(currentTiers))
+  );
 }
 
 function normalizeStatus(expiryMs) {
@@ -388,8 +438,7 @@ function buildBundleState(detail, rssItem) {
     steamGamesTotal += steamGames.length;
     const fallbackGames = rssTiers[index]?.games ?? [];
     const fallbackPrice = rssTiers[index]?.price_cny ?? 0;
-    const price = cnyFromPriceTuple(tier.price) || fallbackPrice;
-    const games = steamGames.map((g) => String(g.title ?? "").trim()).filter(Boolean);
+    const price = fallbackPrice || cnyFromPriceTuple(tier.price);
     const steamGameDetails = steamGames.map((game) => {
       const steamReview = (Array.isArray(game.reviews) ? game.reviews : []).find(
         (x) => String(x?.source ?? "").toLowerCase() === "steam",
@@ -400,25 +449,35 @@ function buildBundleState(detail, rssItem) {
         historical_low_cny: "未确认",
       };
     });
-    const fallbackDetails =
-      steamGameDetails.length > 0
-        ? steamGameDetails
-        : fallbackGames.map((title) => ({
-            title,
-            positive_rate: "未确认",
-            historical_low_cny: "未确认",
-          }));
+    const steamDetailsByTitle = new Map(
+      steamGameDetails.map((gameDetail) => [gameDetail.title, gameDetail]),
+    );
+    const displayedGames = fallbackGames.length
+      ? fallbackGames
+      : steamGameDetails.map((gameDetail) => gameDetail.title);
+    const displayedDetails = displayedGames.map((title) => {
+      const fromSteam = steamDetailsByTitle.get(title);
+      if (fromSteam) {
+        return fromSteam;
+      }
+      return {
+        title,
+        positive_rate: "未确认",
+        historical_low_cny: "未确认",
+      };
+    });
 
     return {
       name: `Tier ${index + 1}`,
       price_cny: price,
-      games: games.length ? games : fallbackGames,
-      game_details: fallbackDetails,
+      games: displayedGames,
+      game_details: displayedDetails,
     };
   });
 
   const hasSteam = steamGamesTotal > 0;
   const expiryMs = toExpiryMillis(liveData.expiry);
+  const rssExpiry = parseRssExpiry(rssItem.description);
   const officialLink = parseOfficialUrl(String(liveData.url ?? ""));
   const itadLink = rssItem.link.replace(/\/+$/, "");
   const minTierPrice = Math.min(
@@ -426,11 +485,14 @@ function buildBundleState(detail, rssItem) {
   );
 
   const stateItem = {
+    itad_id: itadLink.split("/").pop() || "未确认",
     id: normalizeBundleId(officialLink, itadLink),
+    official_link: officialLink || "未确认",
+    itad_link: itadLink,
     title: String(liveData.title ?? rssItem.title ?? "未确认").trim() || "未确认",
     merchant: String(liveData.page?.name ?? "未确认").trim() || "未确认",
     status: normalizeStatus(expiryMs),
-    expiry: toExpiryString(expiryMs),
+    expiry: rssExpiry,
     lowest_price_cny: Number.isFinite(minTierPrice) ? Number(minTierPrice.toFixed(2)) : 0,
     tiers: tiersWithGames.map((tier) => ({
       name: tier.name,
@@ -494,7 +556,7 @@ function diffBundles(previousBundles, currentBundles) {
     if (prev.expiry !== current.expiry) changedFields.push("expiry");
     if (Number(prev.lowest_price_cny) !== Number(current.lowest_price_cny))
       changedFields.push("lowest_price_cny");
-    if (prev.game_fingerprint !== current.game_fingerprint) changedFields.push("game_fingerprint");
+    if (!haveEquivalentTiers(prev.tiers, current.tiers)) changedFields.push("game_fingerprint");
     if (prev.title !== current.title) changedFields.push("title");
     if (prev.merchant !== current.merchant) changedFields.push("merchant");
 
@@ -586,7 +648,10 @@ function pruneStateBundles(bundles) {
       return seen >= cutoff;
     })
     .map((bundle) => ({
+      itad_id: bundle.itad_id,
       id: bundle.id,
+      official_link: bundle.official_link,
+      itad_link: bundle.itad_link,
       title: bundle.title,
       merchant: bundle.merchant,
       status: bundle.status,
