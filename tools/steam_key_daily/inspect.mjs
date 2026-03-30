@@ -6,11 +6,15 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 
 const RSS_URL = "https://isthereanydeal.com/feeds/CN/CNY/bundles.rss";
+const ITAD_API_BASE = "https://api.isthereanydeal.com/games/historylow/v1";
 const MAX_ITEMS = 30;
 const CONCURRENCY = 6;
 const RETAIN_DAYS = 90;
 const DEFAULT_CHAT_ID = "529436356";
 const TELEGRAM_MAX_TEXT = 3900;
+const HISTORY_LOW_BATCH = 40;
+const DEFAULT_PREVIOUS_LIMIT = 3;
+const DEFAULT_MIN_SAVINGS_RATIO = 0.95;
 
 function usage() {
   console.log(
@@ -23,7 +27,9 @@ function usage() {
       "Options:",
       "  --state-path <path>   状态文件路径（必填）",
       "  --out-dir <path>      输出目录（默认 tools/steam_key_daily/out）",
-      "  --previous-limit <n>  增量对比时读取历史条数（默认 0=全量）",
+      "  --previous-limit <n>  增量对比时读取历史条数（默认 3；0=全量）",
+      "  --min-savings-ratio <r>  档位价 <= 国区史低总和×r 视为值得买（默认 0.95，需 API Key）",
+      "  --no-value-filter       关闭史低价值过滤（仍尝试写入史低展示）",
       "  --send                若 added/changed 非空则发送 Telegram",
       "  --write-state         执行完成后写回 --state-path（默认只生成 next_state.json）",
       "  --chat-id <id>        发送目标（默认 529436356）",
@@ -41,7 +47,9 @@ function parseArgs(argv) {
     writeState: false,
     dryRun: false,
     chatId: DEFAULT_CHAT_ID,
-    previousLimit: 0,
+    previousLimit: DEFAULT_PREVIOUS_LIMIT,
+    minSavingsRatio: DEFAULT_MIN_SAVINGS_RATIO,
+    valueFilter: true,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -78,12 +86,25 @@ function parseArgs(argv) {
       continue;
     }
     if (current === "--previous-limit") {
-      const raw = Number(argv[i + 1] ?? "3");
-      if (!Number.isInteger(raw) || raw <= 0) {
-        throw new Error("--previous-limit 必须是正整数");
+      const raw = Number(argv[i + 1] ?? String(DEFAULT_PREVIOUS_LIMIT));
+      if (!Number.isInteger(raw) || raw < 0) {
+        throw new Error("--previous-limit 必须是非负整数（0 表示全量）");
       }
       options.previousLimit = raw;
       i += 1;
+      continue;
+    }
+    if (current === "--min-savings-ratio") {
+      const raw = Number(argv[i + 1] ?? String(DEFAULT_MIN_SAVINGS_RATIO));
+      if (!Number.isFinite(raw) || raw <= 0 || raw > 1) {
+        throw new Error("--min-savings-ratio 应在 (0,1] 内");
+      }
+      options.minSavingsRatio = raw;
+      i += 1;
+      continue;
+    }
+    if (current === "--no-value-filter") {
+      options.valueFilter = false;
       continue;
     }
     throw new Error(`未知参数: ${current}`);
@@ -97,6 +118,184 @@ function parseArgs(argv) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function getItadApiKey() {
+  return (
+    process.env.ITAD_API_KEY ||
+    process.env.ISTHEREANYDEAL_API_KEY ||
+    process.env.APIKEY ||
+    process.env.apikey ||
+    ""
+  ).trim();
+}
+
+function formatHistoricalLowCny(amount) {
+  const n = Number(amount);
+  if (!Number.isFinite(n) || n < 0) {
+    return "未确认";
+  }
+  return `¥${n.toFixed(2)}`;
+}
+
+function parseHistoricalLowCnyLabel(label) {
+  if (typeof label !== "string") {
+    return null;
+  }
+  const trimmed = label.trim();
+  if (trimmed === "未确认" || !trimmed.startsWith("¥")) {
+    return null;
+  }
+  const n = Number(trimmed.slice(1));
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+async function fetchHistoryLowCn(apiKey, gameIds) {
+  if (!apiKey || !Array.isArray(gameIds) || gameIds.length === 0) {
+    return new Map();
+  }
+  const url = new URL(ITAD_API_BASE);
+  url.searchParams.set("key", apiKey);
+  url.searchParams.set("country", "CN");
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+    },
+    body: JSON.stringify(gameIds),
+  });
+  if (!response.ok) {
+    const errText = await response.text().catch(() => "");
+    throw new Error(`ITAD historylow HTTP ${response.status}: ${errText.slice(0, 200)}`);
+  }
+  const rows = await response.json();
+  const map = new Map();
+  if (!Array.isArray(rows)) {
+    return map;
+  }
+  for (const row of rows) {
+    const id = String(row?.id ?? "");
+    const price = row?.low?.price;
+    if (!id || !price) {
+      continue;
+    }
+    const currency = String(price.currency ?? "").toUpperCase();
+    const amount = Number(price.amount);
+    if (currency === "CNY" && Number.isFinite(amount)) {
+      map.set(id, amount);
+    }
+  }
+  return map;
+}
+
+async function fetchHistoryLowCnBatched(apiKey, gameIds) {
+  const unique = [...new Set(gameIds.filter(Boolean))];
+  const map = new Map();
+  for (let i = 0; i < unique.length; i += HISTORY_LOW_BATCH) {
+    const chunk = unique.slice(i, i + HISTORY_LOW_BATCH);
+    const part = await fetchHistoryLowCn(apiKey, chunk);
+    for (const [k, v] of part) {
+      map.set(k, v);
+    }
+  }
+  return map;
+}
+
+function tierPassesValueFilter(tier, ratio) {
+  const details = Array.isArray(tier?.game_details) ? tier.game_details : [];
+  const withId = details.filter((g) => String(g?.itad_game_id ?? "").length > 0);
+  if (withId.length === 0) {
+    return false;
+  }
+  let sumLow = 0;
+  for (const g of withId) {
+    const low = parseHistoricalLowCnyLabel(g.historical_low_cny);
+    if (low === null) {
+      return false;
+    }
+    sumLow += low;
+  }
+  const tierPrice = Number(tier.price_cny);
+  if (!Number.isFinite(tierPrice) || tierPrice <= 0 || sumLow <= 0) {
+    return false;
+  }
+  return tierPrice <= sumLow * ratio;
+}
+
+function bundleIsWorthBuying(bundle, ratio) {
+  const tiers = Array.isArray(bundle._tier_details_for_message) ? bundle._tier_details_for_message : [];
+  return tiers.some((t) => tierPassesValueFilter(t, ratio));
+}
+
+async function enrichBundlesHistoryLowAndWorth(bundles, options) {
+  const apiKey = getItadApiKey();
+  const enrichIds = options.enrichBundleIds instanceof Set ? options.enrichBundleIds : null;
+  const ids = [];
+  for (const bundle of bundles) {
+    if (enrichIds && !enrichIds.has(bundle.id)) {
+      continue;
+    }
+    const tiers = Array.isArray(bundle._tier_details_for_message) ? bundle._tier_details_for_message : [];
+    for (const tier of tiers) {
+      for (const g of tier.game_details ?? []) {
+        if (g?.itad_game_id) {
+          ids.push(String(g.itad_game_id));
+        }
+      }
+    }
+  }
+
+  let lowById = new Map();
+  let historyLowError = "";
+  if (ids.length > 0 && apiKey) {
+    try {
+      lowById = await fetchHistoryLowCnBatched(apiKey, ids);
+    } catch (e) {
+      historyLowError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  for (const bundle of bundles) {
+    const shouldEnrich = !enrichIds || enrichIds.has(bundle.id);
+    const tiers = Array.isArray(bundle._tier_details_for_message) ? bundle._tier_details_for_message : [];
+    if (shouldEnrich) {
+      for (const tier of tiers) {
+        for (const g of tier.game_details ?? []) {
+          const gid = g?.itad_game_id ? String(g.itad_game_id) : "";
+          if (!gid) {
+            continue;
+          }
+          const amount = lowById.get(gid);
+          if (amount !== undefined) {
+            g.historical_low_cny = formatHistoricalLowCny(amount);
+          }
+        }
+      }
+    }
+
+    if (!shouldEnrich) {
+      bundle._worth_buying = true;
+      continue;
+    }
+    if (!options.valueFilter) {
+      bundle._worth_buying = true;
+    } else if (!apiKey) {
+      bundle._worth_buying = false;
+      bundle._value_filter_note = "no_api_key";
+    } else if (historyLowError) {
+      bundle._worth_buying = false;
+      bundle._value_filter_note = historyLowError;
+    } else {
+      bundle._worth_buying = bundleIsWorthBuying(bundle, options.minSavingsRatio);
+    }
+  }
+
+  return {
+    api_key_present: Boolean(apiKey),
+    history_low_error: historyLowError,
+    game_ids_requested: ids.length,
+  };
 }
 
 function hashText(input) {
@@ -444,6 +643,7 @@ function buildBundleState(detail, rssItem) {
         (x) => String(x?.source ?? "").toLowerCase() === "steam",
       );
       return {
+        itad_game_id: String(game.id ?? "").trim() || "",
         title: String(game.title ?? "").trim() || "未确认",
         positive_rate: computePositiveRateText(steamReview),
         historical_low_cny: "未确认",
@@ -461,6 +661,7 @@ function buildBundleState(detail, rssItem) {
         return fromSteam;
       }
       return {
+        itad_game_id: "",
         title,
         positive_rate: "未确认",
         historical_low_cny: "未确认",
@@ -561,10 +762,8 @@ function diffBundles(previousBundles, currentBundles) {
     if (prev.merchant !== current.merchant) changedFields.push("merchant");
 
     if (changedFields.length) {
-      changed.push({
-        ...current,
-        _changed_fields: changedFields,
-      });
+      current._changed_fields = changedFields;
+      changed.push(current);
     }
   }
 
@@ -624,7 +823,7 @@ function buildSummaryMessage({ added, changed, removed, currentBundles }) {
       lines.push(
         `  - ${tier.name}（${formatPrice(tier.price_cny)}，${gameCount}款，单款约${formatPrice(avg)}）`,
       );
-      games.slice(0, 8).forEach((game) => {
+      games.forEach((game) => {
         lines.push(
           `    - ${game.title || "未确认"}（Steam）(史低价格 ${game.historical_low_cny || "未确认"} 好评率 ${game.positive_rate || "未确认"})`,
         );
@@ -745,6 +944,7 @@ async function main() {
     rss_fetch_ms: 0,
     detail_fetch_ms: 0,
     diff_ms: 0,
+    history_low_ms: 0,
     total_ms: 0,
   };
 
@@ -801,11 +1001,27 @@ async function main() {
   const diff = diffBundles(previousBundles, currentBundles);
   metrics.diff_ms = Date.now() - diffStart;
 
-  const shouldNotify = diff.added.length > 0 || diff.changed.length > 0;
+  const enrichIdsRaw = [...diff.added, ...diff.changed].map((b) => b.id);
+  const enrichStart = Date.now();
+  const historyLowMeta = await enrichBundlesHistoryLowAndWorth(currentBundles, {
+    enrichBundleIds: enrichIdsRaw.length > 0 ? new Set(enrichIdsRaw) : null,
+    valueFilter: options.valueFilter,
+    minSavingsRatio: options.minSavingsRatio,
+  });
+  metrics.history_low_ms = Date.now() - enrichStart;
+
+  const worthyAdded = options.valueFilter
+    ? diff.added.filter((b) => b._worth_buying)
+    : [...diff.added];
+  const worthyChanged = options.valueFilter
+    ? diff.changed.filter((b) => b._worth_buying)
+    : [...diff.changed];
+
+  const shouldNotify = worthyAdded.length > 0 || worthyChanged.length > 0;
   const summaryMessage = shouldNotify
     ? buildSummaryMessage({
-        added: diff.added,
-        changed: diff.changed,
+        added: worthyAdded,
+        changed: worthyChanged,
         removed: diff.removed,
         currentBundles,
       })
@@ -835,6 +1051,8 @@ async function main() {
       dry_run: options.dryRun,
       chat_id: options.chatId,
       previous_limit: options.previousLimit,
+      value_filter: options.valueFilter,
+      min_savings_ratio: options.minSavingsRatio,
     },
     counts: {
       rss_items: rssItems.length,
@@ -844,8 +1062,11 @@ async function main() {
       current_steam_bundles: currentBundles.length,
       added: diff.added.length,
       changed: diff.changed.length,
+      worthy_added: worthyAdded.length,
+      worthy_changed: worthyChanged.length,
       removed: diff.removed.length,
     },
+    history_low: historyLowMeta,
     should_notify: shouldNotify,
     parse_errors: detailResults
       .filter((x) => x?.error)
@@ -864,11 +1085,14 @@ async function main() {
     telegram.attempted = true;
     await sendTelegram(options.chatId, summaryMessage);
     telegram.sent = true;
-    telegram.reason = "added_or_changed";
+    telegram.reason = "worthy_added_or_changed";
   } else if (options.send && options.dryRun) {
     telegram.reason = "dry_run";
   } else if (options.send && !shouldNotify) {
-    telegram.reason = "no_added_or_changed";
+    telegram.reason =
+      diff.added.length > 0 || diff.changed.length > 0
+        ? "no_worthy_added_or_changed"
+        : "no_added_or_changed";
   }
 
   if (options.writeState) {
