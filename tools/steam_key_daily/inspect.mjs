@@ -738,6 +738,10 @@ function isInWindow(expiryMs) {
   return expiryMs > Date.now();
 }
 
+function isCurrentBundle(bundle) {
+  return bundle?.status === "在售" && isInWindow(Number(bundle?._expiry_ms ?? 0));
+}
+
 function diffBundles(previousBundles, currentBundles) {
   const prevMap = new Map(previousBundles.map((x) => [x.id, x]));
   const currMap = new Map(currentBundles.map((x) => [x.id, x]));
@@ -833,9 +837,33 @@ function buildSummaryMessage({ added, changed, removed, currentBundles }) {
   return lines.join("\n");
 }
 
+function toStoredBundle(bundle) {
+  return {
+    itad_id: bundle.itad_id,
+    id: bundle.id,
+    official_link: bundle.official_link,
+    itad_link: bundle.itad_link,
+    title: bundle.title,
+    merchant: bundle.merchant,
+    status: bundle.status,
+    expiry: bundle.expiry,
+    lowest_price_cny: bundle.lowest_price_cny,
+    tiers: bundle.tiers,
+    game_fingerprint: bundle.game_fingerprint,
+    last_seen_at: bundle.last_seen_at,
+  };
+}
+
 function pruneStateBundles(bundles) {
   const cutoff = Date.now() - RETAIN_DAYS * 24 * 60 * 60 * 1000;
-  return bundles
+  const deduped = new Map();
+  for (const bundle of bundles) {
+    if (bundle?.id) {
+      deduped.set(bundle.id, bundle);
+    }
+  }
+
+  return [...deduped.values()]
     .filter((bundle) => {
       const seen = Date.parse(bundle.last_seen_at ?? "");
       if (!Number.isFinite(seen)) {
@@ -846,20 +874,24 @@ function pruneStateBundles(bundles) {
       }
       return seen >= cutoff;
     })
-    .map((bundle) => ({
-      itad_id: bundle.itad_id,
-      id: bundle.id,
-      official_link: bundle.official_link,
-      itad_link: bundle.itad_link,
-      title: bundle.title,
-      merchant: bundle.merchant,
-      status: bundle.status,
-      expiry: bundle.expiry,
-      lowest_price_cny: bundle.lowest_price_cny,
-      tiers: bundle.tiers,
-      game_fingerprint: bundle.game_fingerprint,
-      last_seen_at: bundle.last_seen_at,
-    }));
+    .map(toStoredBundle);
+}
+
+function buildNextStateBundles(previousBundles, currentBundles) {
+  const currentIds = new Set(currentBundles.map((bundle) => bundle.id));
+  const carryForward = previousBundles
+    .filter((bundle) => !currentIds.has(bundle.id))
+    .map((bundle) => {
+      if (bundle.status === "在售") {
+        return {
+          ...bundle,
+          status: "结束",
+        };
+      }
+      return bundle;
+    });
+
+  return pruneStateBundles([...carryForward, ...currentBundles]);
 }
 
 async function ensureDir(dirPath) {
@@ -955,8 +987,7 @@ async function main() {
     const bSeen = Date.parse(b.last_seen_at ?? "") || 0;
     return bSeen - aSeen;
   });
-  const previousBundles =
-    options.previousLimit > 0 ? previousSorted.slice(0, options.previousLimit) : previousSorted;
+  const previousBundles = previousSorted;
 
   const rssStart = Date.now();
   const rssXml = await fetchText(RSS_URL);
@@ -994,11 +1025,15 @@ async function main() {
     detailResults
       .filter((result) => result?.hasSteam && result?.stateItem)
       .map((result) => result.stateItem)
-      .filter((bundle) => isInWindow(Number(bundle._expiry_ms ?? 0))),
+      .filter((bundle) => isCurrentBundle(bundle)),
   );
+  const currentBundlesForDiff =
+    previousBundlesAll.length === 0 && options.previousLimit > 0
+      ? currentBundles.slice(0, options.previousLimit)
+      : currentBundles;
 
   const diffStart = Date.now();
-  const diff = diffBundles(previousBundles, currentBundles);
+  const diff = diffBundles(previousBundles, currentBundlesForDiff);
   metrics.diff_ms = Date.now() - diffStart;
 
   const enrichIdsRaw = [...diff.added, ...diff.changed].map((b) => b.id);
@@ -1029,7 +1064,7 @@ async function main() {
 
   const nextState = {
     last_run_at: nowIso(),
-    bundles: pruneStateBundles(currentBundles),
+    bundles: buildNextStateBundles(previousBundlesAll, currentBundles),
   };
 
   const files = {
@@ -1059,6 +1094,7 @@ async function main() {
       deduped_items: dedupedItems.length,
       previous_bundles_total: previousBundlesAll.length,
       previous_bundles_used_for_diff: previousBundles.length,
+      current_bundles_used_for_diff: currentBundlesForDiff.length,
       current_steam_bundles: currentBundles.length,
       added: diff.added.length,
       changed: diff.changed.length,
