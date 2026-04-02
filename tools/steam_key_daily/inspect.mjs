@@ -12,6 +12,9 @@ const CONCURRENCY = 6;
 const RETAIN_DAYS = 90;
 const DEFAULT_CHAT_ID = "529436356";
 const TELEGRAM_MAX_TEXT = 3900;
+const TELEGRAPH_API_CREATE = "https://api.telegra.ph/createPage";
+const TELEGRAPH_CONTENT_MAX_BYTES = 62000;
+const TELEGRAPH_UPLOAD_CONCURRENCY = 3;
 const HISTORY_LOW_BATCH = 40;
 const DEFAULT_PREVIOUS_LIMIT = 3;
 const DEFAULT_MIN_SAVINGS_RATIO = 0.95;
@@ -33,6 +36,7 @@ function usage() {
       "  --send                若 added/changed 非空则发送 Telegram",
       "  --write-state         执行完成后写回 --state-path（默认只生成 next_state.json）",
       "  --chat-id <id>        发送目标（默认 529436356）",
+      "  --no-telegraph        不把 Tier 明细上传到 Telegraph（仍发长文本，仅摘要前 3 条）",
       "  --dry-run             仅演练，不发送 Telegram",
       "  --help                显示帮助",
     ].join("\n"),
@@ -50,6 +54,7 @@ function parseArgs(argv) {
     previousLimit: DEFAULT_PREVIOUS_LIMIT,
     minSavingsRatio: DEFAULT_MIN_SAVINGS_RATIO,
     valueFilter: true,
+    telegraph: true,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -107,6 +112,10 @@ function parseArgs(argv) {
       options.valueFilter = false;
       continue;
     }
+    if (current === "--no-telegraph") {
+      options.telegraph = false;
+      continue;
+    }
     throw new Error(`未知参数: ${current}`);
   }
 
@@ -128,6 +137,101 @@ function getItadApiKey() {
     process.env.apikey ||
     ""
   ).trim();
+}
+
+function getTelegraphAccessToken() {
+  return (process.env.TELEGRAPH_ACCESS_TOKEN || "").trim();
+}
+
+function utf8ByteLength(text) {
+  return Buffer.byteLength(text, "utf8");
+}
+
+function telegraphTitleSafe(title) {
+  const t = String(title ?? "").trim() || "Bundle";
+  if (t.length <= 256) {
+    return t;
+  }
+  return `${t.slice(0, 252)}…`;
+}
+
+function storeLinkForBundle(bundle) {
+  const official = bundle._official_link && bundle._official_link !== "未确认" ? bundle._official_link : "";
+  const itad = bundle._itad_link || "";
+  return official || itad || "";
+}
+
+function buildTelegraphContentNodes(bundle) {
+  const nodes = [];
+  const merchant = String(bundle.merchant ?? "未确认");
+  const status = String(bundle.status ?? "未确认");
+  const expiry = String(bundle.expiry ?? "未确认");
+  nodes.push({
+    tag: "p",
+    children: [
+      `商户：${merchant} | 状态：${status} | 截止：${expiry} | 起价：${formatPrice(bundle.lowest_price_cny)}`,
+    ],
+  });
+  const href = storeLinkForBundle(bundle);
+  if (href) {
+    nodes.push({
+      tag: "p",
+      children: [{ tag: "a", attrs: { href }, children: ["商店 / ITAD 链接"] }],
+    });
+  }
+  nodes.push({ tag: "h4", children: ["Tier 明细"] });
+  const tiers = Array.isArray(bundle._tier_details_for_message) ? bundle._tier_details_for_message : [];
+  for (const tier of tiers) {
+    const games = Array.isArray(tier.game_details) ? tier.game_details : [];
+    const gameCount = games.length;
+    const avg = gameCount ? Number(tier.price_cny) / gameCount : 0;
+    nodes.push({
+      tag: "p",
+      children: [
+        `${tier.name}（${formatPrice(tier.price_cny)}，${gameCount}款，单款约${formatPrice(avg)}）`,
+      ],
+    });
+    if (games.length === 0) {
+      nodes.push({ tag: "p", children: ["（无游戏列表）"] });
+      continue;
+    }
+    nodes.push({
+      tag: "ul",
+      children: games.map((game) => ({
+        tag: "li",
+        children: [
+          `${game.title || "未确认"}（Steam）史低 ${game.historical_low_cny || "未确认"}，好评 ${game.positive_rate || "未确认"}`,
+        ],
+      })),
+    });
+  }
+  return nodes;
+}
+
+async function telegraphCreatePage(accessToken, title, contentNodes) {
+  const body = new URLSearchParams();
+  body.set("access_token", accessToken);
+  body.set("title", title);
+  body.set("content", JSON.stringify(contentNodes));
+  body.set("return_content", "false");
+  const response = await fetch(TELEGRAPH_API_CREATE, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded; charset=utf-8",
+    },
+    body,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!data?.ok) {
+    const err = typeof data?.error === "string" ? data.error : `HTTP ${response.status}`;
+    throw new Error(err);
+  }
+  const url = String(data.result?.url ?? "").trim();
+  const path = String(data.result?.path ?? "").trim();
+  if (!url) {
+    throw new Error("Telegraph 未返回 url");
+  }
+  return { url, path };
 }
 
 function formatHistoricalLowCny(amount) {
@@ -796,7 +900,14 @@ function formatDate(date = new Date()) {
   return `${y}-${m}-${d}`;
 }
 
-function buildSummaryMessage({ added, changed, removed, currentBundles }) {
+function buildSummaryMessage({
+  added,
+  changed,
+  removed,
+  currentBundles,
+  telegraphById,
+  useTelegraphLinks,
+}) {
   const expiring72h = currentBundles.filter((bundle) => {
     const ms = Number(bundle._expiry_ms ?? 0);
     if (!ms || ms < Date.now()) return false;
@@ -807,7 +918,29 @@ function buildSummaryMessage({ added, changed, removed, currentBundles }) {
   lines.push(`Steam低价Key日报（${formatDate()}）`);
   lines.push(`新增 ${added.length}，下线 ${removed.length}，72小时内到期 ${expiring72h}`);
 
-  const focus = [...added, ...changed].slice(0, 3);
+  const focusAll = [...added, ...changed];
+
+  if (useTelegraphLinks && telegraphById instanceof Map) {
+    focusAll.forEach((bundle, idx) => {
+      const store =
+        bundle._official_link && bundle._official_link !== "未确认"
+          ? bundle._official_link
+          : bundle._itad_link || "未确认";
+      lines.push(
+        `${idx + 1}) ${bundle.title} | ${formatPrice(bundle.lowest_price_cny)}起 | 截止 ${bundle.expiry} | ${store}`,
+      );
+      const rec = telegraphById.get(bundle.id);
+      if (rec?.ok && rec.url) {
+        lines.push(`   明细（Telegraph）：${rec.url}`);
+      } else {
+        const err = rec?.error ? String(rec.error) : "unknown";
+        lines.push(`   明细（Telegraph 失败）：${err}`);
+      }
+    });
+    return lines.join("\n");
+  }
+
+  const focus = focusAll.slice(0, 3);
   focus.forEach((bundle, idx) => {
     const link =
       bundle._official_link && bundle._official_link !== "未确认"
@@ -928,6 +1061,26 @@ async function mapWithConcurrency(items, concurrency, worker) {
 
   await Promise.all(runners);
   return results;
+}
+
+async function uploadBundleDetailsToTelegraph(bundles, accessToken) {
+  const byId = new Map();
+  await mapWithConcurrency(bundles, TELEGRAPH_UPLOAD_CONCURRENCY, async (bundle) => {
+    const id = bundle.id;
+    try {
+      const nodes = buildTelegraphContentNodes(bundle);
+      const payload = JSON.stringify(nodes);
+      if (utf8ByteLength(payload) > TELEGRAPH_CONTENT_MAX_BYTES) {
+        throw new Error("CONTENT_TOO_LARGE");
+      }
+      const page = await telegraphCreatePage(accessToken, telegraphTitleSafe(bundle.title), nodes);
+      byId.set(id, { ok: true, url: page.url, path: page.path });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      byId.set(id, { ok: false, error: msg });
+    }
+  });
+  return byId;
 }
 
 function truncateTelegramText(text) {
@@ -1053,12 +1206,64 @@ async function main() {
     : [...diff.changed];
 
   const shouldNotify = worthyAdded.length > 0 || worthyChanged.length > 0;
+  const focusBundlesForNotify = [...worthyAdded, ...worthyChanged];
+  const telegraphToken = getTelegraphAccessToken();
+  const wantTelegraph = Boolean(options.telegraph && telegraphToken);
+  let telegraphById = new Map();
+  const telegraphRuntime = {
+    requested: Boolean(options.telegraph),
+    attempted: false,
+    used_links_in_message: false,
+    reason: !options.telegraph
+      ? "disabled_flag"
+      : !telegraphToken
+        ? "no_access_token"
+        : "not_needed",
+    pages_ok: 0,
+    pages_failed: 0,
+  };
+
+  if (shouldNotify && wantTelegraph && !options.dryRun) {
+    telegraphRuntime.attempted = true;
+    telegraphRuntime.reason = "uploaded";
+    telegraphById = await uploadBundleDetailsToTelegraph(focusBundlesForNotify, telegraphToken);
+    for (const rec of telegraphById.values()) {
+      if (rec?.ok) {
+        telegraphRuntime.pages_ok += 1;
+      } else {
+        telegraphRuntime.pages_failed += 1;
+      }
+    }
+  } else if (shouldNotify && options.telegraph && !telegraphToken) {
+    telegraphRuntime.reason = "no_access_token";
+  } else if (shouldNotify && options.dryRun && options.telegraph && telegraphToken) {
+    telegraphRuntime.reason = "dry_run_skip_upload";
+  } else if (!shouldNotify) {
+    telegraphRuntime.reason = "not_needed";
+  }
+
+  const useTelegraphLinks =
+    shouldNotify &&
+    wantTelegraph &&
+    !options.dryRun &&
+    telegraphRuntime.attempted &&
+    focusBundlesForNotify.length > 0 &&
+    telegraphRuntime.pages_ok > 0;
+
+  if (useTelegraphLinks) {
+    telegraphRuntime.used_links_in_message = true;
+  } else if (telegraphRuntime.attempted && telegraphRuntime.pages_ok === 0) {
+    telegraphRuntime.reason = "all_uploads_failed_fallback_inline";
+  }
+
   const summaryMessage = shouldNotify
     ? buildSummaryMessage({
         added: worthyAdded,
         changed: worthyChanged,
         removed: diff.removed,
         currentBundles,
+        telegraphById,
+        useTelegraphLinks,
       })
     : "";
 
@@ -1088,7 +1293,9 @@ async function main() {
       previous_limit: options.previousLimit,
       value_filter: options.valueFilter,
       min_savings_ratio: options.minSavingsRatio,
+      telegraph: options.telegraph,
     },
+    telegraph: telegraphRuntime,
     counts: {
       rss_items: rssItems.length,
       deduped_items: dedupedItems.length,
@@ -1138,6 +1345,14 @@ async function main() {
   metrics.total_ms = Date.now() - startedAt;
   runtime.timings = metrics;
   runtime.telegram = telegram;
+  if (telegraphRuntime.attempted && telegraphById.size > 0) {
+    runtime.telegraph_pages = Object.fromEntries(
+      [...telegraphById.entries()].map(([id, rec]) => [
+        id,
+        rec.ok ? { ok: true, url: rec.url } : { ok: false, error: rec.error },
+      ]),
+    );
+  }
   await fs.writeFile(files.runtime, JSON.stringify(runtime, null, 2), "utf8");
 
   console.log(
