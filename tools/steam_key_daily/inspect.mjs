@@ -4,7 +4,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
 
 const RSS_URL = "https://isthereanydeal.com/feeds/CN/CNY/bundles.rss";
 const ITAD_API_BASE = "https://api.isthereanydeal.com/games/historylow/v1";
@@ -13,8 +12,6 @@ const CONCURRENCY = 6;
 const RETAIN_DAYS = 90;
 const DEFAULT_CHAT_ID = "529436356";
 const TELEGRAM_MAX_TEXT = 3900;
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_TELEGRAPH_CONFIG_PATH = path.join(__dirname, "telegraph_account.json");
 const TELEGRAPH_API_CREATE_ACCOUNT = "https://api.telegra.ph/createAccount";
 const TELEGRAPH_API_CREATE = "https://api.telegra.ph/createPage";
 const TELEGRAPH_CONTENT_MAX_BYTES = 62000;
@@ -41,7 +38,7 @@ function usage() {
       "  --send                若 added/changed 非空则发送 Telegram",
       "  --write-state         执行完成后写回 --state-path（默认只生成 next_state.json）",
       "  --chat-id <id>        发送目标（默认 529436356）",
-      "  --telegraph-config <path>  Telegraph token 配置文件（默认 tools/.../telegraph_account.json）",
+      "  --telegraph-config <path>  Telegraph token 配置文件（默认与 --state-path 同目录下的 telegraph_account.json）",
       "  --no-telegraph        不把 Tier 明细上传到 Telegraph（仍发长文本，仅摘要前 3 条）",
       "  --dry-run             仅演练，不发送 Telegram",
       "  --help                显示帮助",
@@ -159,7 +156,8 @@ function getTelegraphConfigPath(options) {
   if (options.telegraphConfigPath) {
     return path.resolve(options.telegraphConfigPath);
   }
-  return DEFAULT_TELEGRAPH_CONFIG_PATH;
+  const stateDir = path.dirname(path.resolve(options.statePath));
+  return path.join(stateDir, "telegraph_account.json");
 }
 
 function generateTelegraphShortName() {
