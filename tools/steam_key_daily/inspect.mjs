@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const RSS_URL = "https://isthereanydeal.com/feeds/CN/CNY/bundles.rss";
 const ITAD_API_BASE = "https://api.isthereanydeal.com/games/historylow/v1";
@@ -12,9 +13,13 @@ const CONCURRENCY = 6;
 const RETAIN_DAYS = 90;
 const DEFAULT_CHAT_ID = "529436356";
 const TELEGRAM_MAX_TEXT = 3900;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_TELEGRAPH_CONFIG_PATH = path.join(__dirname, "telegraph_account.json");
+const TELEGRAPH_API_CREATE_ACCOUNT = "https://api.telegra.ph/createAccount";
 const TELEGRAPH_API_CREATE = "https://api.telegra.ph/createPage";
 const TELEGRAPH_CONTENT_MAX_BYTES = 62000;
 const TELEGRAPH_UPLOAD_CONCURRENCY = 3;
+const TELEGRAPH_AUTO_AUTHOR_NAME = "Steam Key Daily";
 const HISTORY_LOW_BATCH = 40;
 const DEFAULT_PREVIOUS_LIMIT = 3;
 const DEFAULT_MIN_SAVINGS_RATIO = 0.95;
@@ -36,6 +41,7 @@ function usage() {
       "  --send                若 added/changed 非空则发送 Telegram",
       "  --write-state         执行完成后写回 --state-path（默认只生成 next_state.json）",
       "  --chat-id <id>        发送目标（默认 529436356）",
+      "  --telegraph-config <path>  Telegraph token 配置文件（默认 tools/.../telegraph_account.json）",
       "  --no-telegraph        不把 Tier 明细上传到 Telegraph（仍发长文本，仅摘要前 3 条）",
       "  --dry-run             仅演练，不发送 Telegram",
       "  --help                显示帮助",
@@ -55,6 +61,7 @@ function parseArgs(argv) {
     minSavingsRatio: DEFAULT_MIN_SAVINGS_RATIO,
     valueFilter: true,
     telegraph: true,
+    telegraphConfigPath: "",
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -116,6 +123,11 @@ function parseArgs(argv) {
       options.telegraph = false;
       continue;
     }
+    if (current === "--telegraph-config") {
+      options.telegraphConfigPath = argv[i + 1] ?? "";
+      i += 1;
+      continue;
+    }
     throw new Error(`未知参数: ${current}`);
   }
 
@@ -139,8 +151,117 @@ function getItadApiKey() {
   ).trim();
 }
 
-function getTelegraphAccessToken() {
-  return (process.env.TELEGRAPH_ACCESS_TOKEN || "").trim();
+function getTelegraphConfigPath(options) {
+  const fromEnv = (process.env.TELEGRAPH_CONFIG_PATH || "").trim();
+  if (fromEnv) {
+    return path.resolve(fromEnv);
+  }
+  if (options.telegraphConfigPath) {
+    return path.resolve(options.telegraphConfigPath);
+  }
+  return DEFAULT_TELEGRAPH_CONFIG_PATH;
+}
+
+function generateTelegraphShortName() {
+  const hex = crypto.randomBytes(8).toString("hex");
+  const name = `skd${hex}`;
+  return name.length <= 32 ? name : name.slice(0, 32);
+}
+
+async function telegraphCreateAccount(shortName, authorName) {
+  const body = new URLSearchParams();
+  body.set("short_name", shortName);
+  body.set("author_name", authorName);
+  const response = await fetch(TELEGRAPH_API_CREATE_ACCOUNT, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded; charset=utf-8",
+    },
+    body,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!data?.ok) {
+    const err = typeof data?.error === "string" ? data.error : `HTTP ${response.status}`;
+    throw new Error(err);
+  }
+  return data.result ?? {};
+}
+
+async function readTelegraphConfigFile(configPath) {
+  try {
+    const raw = await fs.readFile(configPath, "utf8");
+    const parsed = JSON.parse(raw);
+    const token = String(parsed?.access_token ?? "").trim();
+    return { token, raw: parsed };
+  } catch {
+    return { token: "", raw: null };
+  }
+}
+
+/**
+ * 解析顺序：环境变量 TELEGRAPH_ACCESS_TOKEN → 配置文件 →（非 dry-run 且需推送时）Telegraph createAccount 自动建号并写回配置。
+ */
+async function resolveTelegraphAccessToken({ telegraphEnabled, shouldNotify, dryRun, configPath }) {
+  const out = {
+    token: "",
+    source: "none",
+    created: false,
+    configPath,
+    error: "",
+  };
+
+  const envTok = (process.env.TELEGRAPH_ACCESS_TOKEN || "").trim();
+  if (envTok) {
+    out.token = envTok;
+    out.source = "env";
+    return out;
+  }
+
+  const fromFile = await readTelegraphConfigFile(configPath);
+  if (fromFile.token) {
+    out.token = fromFile.token;
+    out.source = "config_file";
+    return out;
+  }
+
+  const shouldAutoCreate = telegraphEnabled && shouldNotify && !dryRun;
+  if (!shouldAutoCreate) {
+    return out;
+  }
+
+  const maxAttempts = 4;
+  let lastErr = "";
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const shortName = generateTelegraphShortName();
+    try {
+      const account = await telegraphCreateAccount(shortName, TELEGRAPH_AUTO_AUTHOR_NAME);
+      const token = String(account.access_token ?? "").trim();
+      if (!token) {
+        throw new Error("createAccount 未返回 access_token");
+      }
+      const payload = {
+        access_token: token,
+        short_name: String(account.short_name ?? shortName).slice(0, 32),
+        author_name: String(account.author_name ?? TELEGRAPH_AUTO_AUTHOR_NAME).slice(0, 128),
+        created_at: nowIso(),
+      };
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      await fs.writeFile(configPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+      out.token = token;
+      out.source = "auto_created";
+      out.created = true;
+      return out;
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e);
+      if (lastErr.includes("SHORT_NAME") || lastErr.includes("OCCUPIED")) {
+        continue;
+      }
+      break;
+    }
+  }
+
+  out.error = lastErr || "createAccount_failed";
+  return out;
 }
 
 function utf8ByteLength(text) {
@@ -1207,21 +1328,44 @@ async function main() {
 
   const shouldNotify = worthyAdded.length > 0 || worthyChanged.length > 0;
   const focusBundlesForNotify = [...worthyAdded, ...worthyChanged];
-  const telegraphToken = getTelegraphAccessToken();
+  const telegraphConfigPath = getTelegraphConfigPath(options);
+  const telegraphResolve = await resolveTelegraphAccessToken({
+    telegraphEnabled: options.telegraph,
+    shouldNotify,
+    dryRun: options.dryRun,
+    configPath: telegraphConfigPath,
+  });
+  const telegraphToken = telegraphResolve.token;
   const wantTelegraph = Boolean(options.telegraph && telegraphToken);
   let telegraphById = new Map();
   const telegraphRuntime = {
     requested: Boolean(options.telegraph),
     attempted: false,
     used_links_in_message: false,
-    reason: !options.telegraph
-      ? "disabled_flag"
-      : !telegraphToken
-        ? "no_access_token"
-        : "not_needed",
+    config_path: telegraphConfigPath,
+    token_source: telegraphResolve.source,
+    account_auto_created: telegraphResolve.created,
+    create_account_error: telegraphResolve.error || "",
+    reason: "not_needed",
     pages_ok: 0,
     pages_failed: 0,
   };
+
+  if (!options.telegraph) {
+    telegraphRuntime.reason = "disabled_flag";
+  } else if (!shouldNotify) {
+    telegraphRuntime.reason = "not_needed";
+  } else if (!telegraphToken) {
+    if (options.dryRun) {
+      telegraphRuntime.reason = "dry_run_skip_auto_create";
+    } else {
+      telegraphRuntime.reason = telegraphResolve.error ? "auto_create_failed" : "no_token";
+    }
+  } else if (options.dryRun) {
+    telegraphRuntime.reason = "dry_run_skip_upload";
+  } else {
+    telegraphRuntime.reason = "pending_upload";
+  }
 
   if (shouldNotify && wantTelegraph && !options.dryRun) {
     telegraphRuntime.attempted = true;
@@ -1234,12 +1378,6 @@ async function main() {
         telegraphRuntime.pages_failed += 1;
       }
     }
-  } else if (shouldNotify && options.telegraph && !telegraphToken) {
-    telegraphRuntime.reason = "no_access_token";
-  } else if (shouldNotify && options.dryRun && options.telegraph && telegraphToken) {
-    telegraphRuntime.reason = "dry_run_skip_upload";
-  } else if (!shouldNotify) {
-    telegraphRuntime.reason = "not_needed";
   }
 
   const useTelegraphLinks =
@@ -1294,6 +1432,7 @@ async function main() {
       value_filter: options.valueFilter,
       min_savings_ratio: options.minSavingsRatio,
       telegraph: options.telegraph,
+      telegraph_config_path: telegraphConfigPath,
     },
     telegraph: telegraphRuntime,
     counts: {
