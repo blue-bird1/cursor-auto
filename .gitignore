@@ -3,4 +3,3 @@ dist
 node_modules
 tools/steam_key_daily/out
 tools/steam_key_daily/state.local.json
-tools/steam_key_daily/telegraph_account.json
