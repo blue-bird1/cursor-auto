@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const RSS_URL = "https://isthereanydeal.com/feeds/CN/CNY/bundles.rss";
 const ITAD_API_BASE = "https://api.isthereanydeal.com/games/historylow/v1";
@@ -20,6 +21,7 @@ const TELEGRAPH_AUTO_AUTHOR_NAME = "Steam Key Daily";
 const HISTORY_LOW_BATCH = 40;
 const DEFAULT_PREVIOUS_LIMIT = 3;
 const DEFAULT_MIN_SAVINGS_RATIO = 0.95;
+const PRICE_CHANGE_EPSILON_CNY = 0.5;
 
 function usage() {
   console.log(
@@ -804,6 +806,20 @@ function computeGameFingerprint(tiers) {
   return hashText(JSON.stringify(normalized));
 }
 
+function pricesDifferMeaningfully(prevPrice, currentPrice) {
+  const prev = Number(prevPrice);
+  const current = Number(currentPrice);
+  const prevOk = Number.isFinite(prev);
+  const currentOk = Number.isFinite(current);
+  if (!prevOk && !currentOk) {
+    return false;
+  }
+  if (prevOk !== currentOk) {
+    return true;
+  }
+  return Math.abs(prev - current) > PRICE_CHANGE_EPSILON_CNY;
+}
+
 function normalizeTierPrice(price, games) {
   const num = Number(price);
   if (!Number.isFinite(num) || num <= 0) {
@@ -825,10 +841,27 @@ function normalizeTiersForComparison(tiers) {
 }
 
 function haveEquivalentTiers(prevTiers, currentTiers) {
-  return (
-    JSON.stringify(normalizeTiersForComparison(prevTiers)) ===
-    JSON.stringify(normalizeTiersForComparison(currentTiers))
-  );
+  const prev = normalizeTiersForComparison(prevTiers);
+  const current = normalizeTiersForComparison(currentTiers);
+  if (prev.length !== current.length) {
+    return false;
+  }
+
+  for (let i = 0; i < prev.length; i += 1) {
+    const prevTier = prev[i];
+    const currentTier = current[i];
+    if (prevTier.name !== currentTier.name) {
+      return false;
+    }
+    if (JSON.stringify(prevTier.games) !== JSON.stringify(currentTier.games)) {
+      return false;
+    }
+    if (pricesDifferMeaningfully(prevTier.price_cny, currentTier.price_cny)) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function normalizeStatus(expiryMs) {
@@ -838,8 +871,29 @@ function normalizeStatus(expiryMs) {
   return expiryMs > Date.now() ? "在售" : "结束";
 }
 
+function normalizeBundleUrl(rawUrl) {
+  const raw = String(rawUrl ?? "").trim();
+  if (!raw) {
+    return "";
+  }
+
+  try {
+    const url = new URL(raw);
+    url.hash = "";
+    url.search = "";
+    url.pathname = url.pathname.replace(/\/{2,}/g, "/");
+    if (url.hostname === "www.fanatical.com") {
+      url.pathname = url.pathname.replace(/^\/[a-z]{2}(?=\/)/i, "");
+    }
+    url.pathname = url.pathname.replace(/\/+$/, "");
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return raw.replace(/\/+$/, "");
+  }
+}
+
 function normalizeBundleId(officialUrl, itadLink) {
-  return officialUrl || itadLink.replace(/\/+$/, "");
+  return normalizeBundleUrl(officialUrl) || normalizeBundleUrl(itadLink);
 }
 
 function buildBundleState(detail, rssItem) {
@@ -982,7 +1036,7 @@ function diffBundles(previousBundles, currentBundles) {
     const changedFields = [];
     if (prev.status !== current.status) changedFields.push("status");
     if (prev.expiry !== current.expiry) changedFields.push("expiry");
-    if (Number(prev.lowest_price_cny) !== Number(current.lowest_price_cny))
+    if (pricesDifferMeaningfully(prev.lowest_price_cny, current.lowest_price_cny))
       changedFields.push("lowest_price_cny");
     if (!haveEquivalentTiers(prev.tiers, current.tiers)) changedFields.push("game_fingerprint");
     if (prev.title !== current.title) changedFields.push("title");
@@ -1507,17 +1561,27 @@ async function main() {
   );
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(
-    JSON.stringify(
-      {
-        success: false,
-        error: message,
-      },
-      null,
-      2,
-    ),
-  );
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(
+      JSON.stringify(
+        {
+          success: false,
+          error: message,
+        },
+        null,
+        2,
+      ),
+    );
+    process.exit(1);
+  });
+}
+
+export {
+  diffBundles,
+  haveEquivalentTiers,
+  normalizeBundleId,
+  normalizeBundleUrl,
+  pricesDifferMeaningfully,
+};
