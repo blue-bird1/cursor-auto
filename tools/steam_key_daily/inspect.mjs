@@ -37,7 +37,7 @@ function usage() {
       "  --previous-limit <n>  增量对比时读取历史条数（默认 3；0=全量）",
       "  --min-savings-ratio <r>  档位价 <= 国区史低总和×r 视为值得买（默认 0.95，需 API Key）",
       "  --no-value-filter       关闭史低价值过滤（仍尝试写入史低展示）",
-      "  --send                若 added/changed 非空则发送 Telegram",
+      "  --send                若存在值得买的新增 bundle 则发送 Telegram",
       "  --write-state         执行完成后写回 --state-path（默认只生成 next_state.json）",
       "  --chat-id <id>        发送目标（默认 529436356）",
       "  --telegraph-config <path>  Telegraph token 配置文件（默认与 --state-path 同目录下的 telegraph_account.json）",
@@ -1031,20 +1031,6 @@ function diffBundles(previousBundles, currentBundles) {
     const prev = prevMap.get(current.id);
     if (!prev) {
       added.push(current);
-      continue;
-    }
-    const changedFields = [];
-    if (prev.status !== current.status) changedFields.push("status");
-    if (prev.expiry !== current.expiry) changedFields.push("expiry");
-    if (pricesDifferMeaningfully(prev.lowest_price_cny, current.lowest_price_cny))
-      changedFields.push("lowest_price_cny");
-    if (!haveEquivalentTiers(prev.tiers, current.tiers)) changedFields.push("game_fingerprint");
-    if (prev.title !== current.title) changedFields.push("title");
-    if (prev.merchant !== current.merchant) changedFields.push("merchant");
-
-    if (changedFields.length) {
-      current._changed_fields = changedFields;
-      changed.push(current);
     }
   }
 
@@ -1075,7 +1061,6 @@ function formatDate(date = new Date()) {
 
 function buildSummaryMessage({
   added,
-  changed,
   removed,
   currentBundles,
   telegraphById,
@@ -1091,7 +1076,7 @@ function buildSummaryMessage({
   lines.push(`Steam低价Key日报（${formatDate()}）`);
   lines.push(`新增 ${added.length}，下线 ${removed.length}，72小时内到期 ${expiring72h}`);
 
-  const focusAll = [...added, ...changed];
+  const focusAll = [...added];
 
   if (useTelegraphLinks && telegraphById instanceof Map) {
     focusAll.forEach((bundle, idx) => {
@@ -1362,7 +1347,7 @@ async function main() {
   const diff = diffBundles(previousBundles, currentBundlesForDiff);
   metrics.diff_ms = Date.now() - diffStart;
 
-  const enrichIdsRaw = [...diff.added, ...diff.changed].map((b) => b.id);
+  const enrichIdsRaw = diff.added.map((b) => b.id);
   const enrichStart = Date.now();
   const historyLowMeta = await enrichBundlesHistoryLowAndWorth(currentBundles, {
     enrichBundleIds: enrichIdsRaw.length > 0 ? new Set(enrichIdsRaw) : null,
@@ -1374,12 +1359,9 @@ async function main() {
   const worthyAdded = options.valueFilter
     ? diff.added.filter((b) => b._worth_buying)
     : [...diff.added];
-  const worthyChanged = options.valueFilter
-    ? diff.changed.filter((b) => b._worth_buying)
-    : [...diff.changed];
 
-  const shouldNotify = worthyAdded.length > 0 || worthyChanged.length > 0;
-  const focusBundlesForNotify = [...worthyAdded, ...worthyChanged];
+  const shouldNotify = worthyAdded.length > 0;
+  const focusBundlesForNotify = [...worthyAdded];
   const telegraphConfigPath = getTelegraphConfigPath(options);
   const telegraphResolve = await resolveTelegraphAccessToken({
     telegraphEnabled: options.telegraph,
@@ -1449,7 +1431,6 @@ async function main() {
   const summaryMessage = shouldNotify
     ? buildSummaryMessage({
         added: worthyAdded,
-        changed: worthyChanged,
         removed: diff.removed,
         currentBundles,
         telegraphById,
@@ -1497,7 +1478,7 @@ async function main() {
       added: diff.added.length,
       changed: diff.changed.length,
       worthy_added: worthyAdded.length,
-      worthy_changed: worthyChanged.length,
+      worthy_changed: 0,
       removed: diff.removed.length,
     },
     history_low: historyLowMeta,
@@ -1519,14 +1500,11 @@ async function main() {
     telegram.attempted = true;
     await sendTelegram(options.chatId, summaryMessage);
     telegram.sent = true;
-    telegram.reason = "worthy_added_or_changed";
+    telegram.reason = "worthy_added";
   } else if (options.send && options.dryRun) {
     telegram.reason = "dry_run";
   } else if (options.send && !shouldNotify) {
-    telegram.reason =
-      diff.added.length > 0 || diff.changed.length > 0
-        ? "no_worthy_added_or_changed"
-        : "no_added_or_changed";
+    telegram.reason = diff.added.length > 0 ? "no_worthy_added" : "no_added";
   }
 
   if (options.writeState) {

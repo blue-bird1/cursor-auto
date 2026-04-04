@@ -1,11 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import {
-  diffBundles,
-  normalizeBundleId,
-  pricesDifferMeaningfully,
-} from "../tools/steam_key_daily/inspect.mjs";
+import { diffBundles, normalizeBundleId } from "../tools/steam_key_daily/inspect.mjs";
 
 function makeBundle(overrides = {}) {
   return {
@@ -26,12 +22,7 @@ function makeBundle(overrides = {}) {
   };
 }
 
-test("pricesDifferMeaningfully ignores tiny CNY drift", () => {
-  assert.equal(pricesDifferMeaningfully(48.1, 48.18), false);
-  assert.equal(pricesDifferMeaningfully(48.1, 48.7), true);
-});
-
-test("diffBundles ignores price-only drift within epsilon", () => {
+test("diffBundles no longer reports changed bundles", () => {
   const previous = [
     makeBundle({
       lowest_price_cny: 48.1,
@@ -51,7 +42,7 @@ test("diffBundles ignores price-only drift within epsilon", () => {
   assert.equal(diff.removed.length, 0);
 });
 
-test("diffBundles still detects material tier changes", () => {
+test("diffBundles ignores material edits for existing bundles", () => {
   const previous = [makeBundle()];
   const current = [
     makeBundle({
@@ -61,8 +52,25 @@ test("diffBundles still detects material tier changes", () => {
   ];
 
   const diff = diffBundles(previous, current);
-  assert.equal(diff.changed.length, 1);
-  assert.deepEqual(diff.changed[0]._changed_fields, ["lowest_price_cny", "game_fingerprint"]);
+  assert.equal(diff.added.length, 0);
+  assert.equal(diff.changed.length, 0);
+  assert.equal(diff.removed.length, 0);
+});
+
+test("diffBundles still reports truly new bundles", () => {
+  const previous = [makeBundle()];
+  const current = [
+    makeBundle(),
+    makeBundle({
+      id: "https://www.humblebundle.com/games/new-bundle",
+      title: "Brand New Bundle",
+    }),
+  ];
+
+  const diff = diffBundles(previous, current);
+  assert.equal(diff.added.length, 1);
+  assert.equal(diff.added[0].title, "Brand New Bundle");
+  assert.equal(diff.changed.length, 0);
 });
 
 test("normalizeBundleId canonicalizes Fanatical locale path", () => {
