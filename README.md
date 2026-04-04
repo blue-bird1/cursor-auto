@@ -104,7 +104,7 @@ TELEGRAM_DEFAULT_CHAT_ID=
 # 仅演练（不发消息、不写回）
 ./scripts/steam_key_daily.sh --state-path tools/steam_key_daily/state.local.json --dry-run
 
-# 有「值得买」的新增/变更时发送（需 ITAD_API_KEY），并写回本地状态
+# 有「值得买」的新增时发送（需 ITAD_API_KEY），并写回本地状态
 export ITAD_API_KEY="你的 ITAD API Key"
 ./scripts/steam_key_daily.sh --state-path tools/steam_key_daily/state.local.json --send --write-state
 ```
